@@ -6,8 +6,11 @@ Ako to funguje:
 2. Pre kazdu kartu zisti Clockify task ID:
    - ak uz karta ma ulozene ID v custom field "Clockify Task ID", pouzije ho
      priamo (nezalezi na tom, ako sa karta odvtedy premenovala),
-   - ak este ID ulozene nema, najde task podla NAZVU (jednorazovo, len pri
-     prvom sparovani) a ID si ulozi na kartu pre buduce behy.
+   - ak este ID ulozene nema, skusi najst task podla NAZVU,
+   - ak sa ani podla nazvu nic nenajde, task v Clockify SAM VYTVORI
+     (rovnaky nazov ako karta) a jeho ID si ulozi na kartu.
+   Vysledok: netreba nic v Clockify vytvarat rucne, kazda karta si svoj
+   task zabezpeci sama pri prvom behu.
 3. Ak sa nazov karty odvtedy zmenil, skript premenuje aj Clockify task,
    aby si oba nazvy zostali zosynchronizovane (cisto informativne, na
    parovanie sa uz nepouziva).
@@ -43,19 +46,25 @@ TRELLO_BASE = "https://api.trello.com/1"
 CLOCKIFY_HEADERS = {"X-Api-Key": CLOCKIFY_API_KEY}
 
 
-def clockify_get(path, params=None, retries=5):
-    """GET na Clockify API s automatickym cakanim pri 429 (Too Many Requests)."""
+def clockify_request(method, path, params=None, json_body=None, retries=5):
+    """Volanie na Clockify API (GET/POST/PUT/...) s automatickym cakanim pri 429."""
     url = f"{CLOCKIFY_BASE}{path}"
     for attempt in range(retries):
-        r = requests.get(url, headers=CLOCKIFY_HEADERS, params=params, timeout=30)
+        r = requests.request(method, url, headers=CLOCKIFY_HEADERS, params=params, json=json_body, timeout=30)
         if r.status_code == 429:
             wait = 2 ** attempt
             print(f"  Clockify vrátil 429 (limit), čakám {wait}s a skúšam znova...")
             time.sleep(wait)
             continue
+        if r.status_code == 404:
+            return None
         r.raise_for_status()
-        return r.json()
+        return r.json() if r.text else None
     r.raise_for_status()
+
+
+def clockify_get(path, params=None):
+    return clockify_request("GET", path, params=params)
 
 
 def trello_request(method, path, params=None, json_body=None):
@@ -121,20 +130,25 @@ def find_clockify_task_by_name(card_name):
 
 def get_clockify_task_by_id(task_id):
     """Vrati task, alebo None ak uz neexistuje (napr. bol v Clockify zmazany)."""
-    try:
-        return clockify_get(
-            f"/workspaces/{CLOCKIFY_WORKSPACE_ID}/projects/{CLOCKIFY_PROJECT_ID}/tasks/{task_id}"
-        )
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            return None
-        raise
+    return clockify_request(
+        "GET", f"/workspaces/{CLOCKIFY_WORKSPACE_ID}/projects/{CLOCKIFY_PROJECT_ID}/tasks/{task_id}"
+    )
 
 
 def rename_clockify_task(task_id, new_name):
-    url = f"{CLOCKIFY_BASE}/workspaces/{CLOCKIFY_WORKSPACE_ID}/projects/{CLOCKIFY_PROJECT_ID}/tasks/{task_id}"
-    r = requests.put(url, headers=CLOCKIFY_HEADERS, json={"name": new_name}, timeout=30)
-    r.raise_for_status()
+    clockify_request(
+        "PUT",
+        f"/workspaces/{CLOCKIFY_WORKSPACE_ID}/projects/{CLOCKIFY_PROJECT_ID}/tasks/{task_id}",
+        json_body={"name": new_name},
+    )
+
+
+def create_clockify_task(name):
+    return clockify_request(
+        "POST",
+        f"/workspaces/{CLOCKIFY_WORKSPACE_ID}/projects/{CLOCKIFY_PROJECT_ID}/tasks",
+        json_body={"name": name},
+    )
 
 
 def store_task_id_on_card(card_id, task_id_field_id, task_id):
@@ -195,7 +209,10 @@ def resolve_task_for_card(card, task_id_field_id):
     1. Ak karta uz ma ulozene ID, over ze task este existuje a ak sa
        nazov karty odvtedy zmenil, premenuje aj Clockify task.
     2. Ak ID ulozene nema (prve sparovanie, alebo ulozeny task uz
-       neexistuje), najde task podla aktualneho nazvu karty a ID ulozi.
+       neexistuje), skusi najst task podla aktualneho nazvu karty.
+    3. Ak sa ani podla nazvu nic nenajde, task v Clockify SAM VYTVORI.
+    Vo vsetkych pripadoch, kde sa task najde/vytvori nanovo, ID sa
+    ulozi na kartu.
     """
     stored_id = get_stored_task_id(card, task_id_field_id)
 
@@ -209,10 +226,14 @@ def resolve_task_for_card(card, task_id_field_id):
         print(f"    Uložené ID {stored_id} už v Clockify neexistuje, hľadám podľa mena...")
 
     task = find_clockify_task_by_name(card["name"])
-    if not task:
-        return None
+    if task:
+        store_task_id_on_card(card["id"], task_id_field_id, task["id"])
+        print(f"    Prvé spárovanie (existujúci task) -> uložené ID {task['id']}.")
+        return task["id"]
+
+    task = create_clockify_task(card["name"])
     store_task_id_on_card(card["id"], task_id_field_id, task["id"])
-    print(f"    Prvé spárovanie -> uložené Clockify Task ID {task['id']} na kartu.")
+    print(f"    Task v Clockify neexistoval -> vytvorený nový, ID {task['id']}.")
     return task["id"]
 
 
@@ -231,9 +252,10 @@ def main():
 
     ok, skipped = 0, 0
     for card in cards:
-        task_id = resolve_task_for_card(card, task_id_field_id)
-        if not task_id:
-            print(f"  Preskakujem '{card['name']}' — nenašiel sa zhodný Clockify task.")
+        try:
+            task_id = resolve_task_for_card(card, task_id_field_id)
+        except requests.HTTPError as e:
+            print(f"  Preskakujem '{card['name']}' — chyba pri práci s Clockify taskom: {e}")
             skipped += 1
             continue
         seconds = sum_task_seconds(task_id, users)
@@ -241,8 +263,9 @@ def main():
         update_custom_field(card["id"], hours_field_id, hours)
         print(f"  '{card['name']}' -> {hours} h")
         ok += 1
+        time.sleep(0.2)  # drobna pauza medzi kartami, setri limit na Free plane
 
-    print(f"Hotovo. Aktualizovaných: {ok}, preskočených (bez zhody): {skipped}.")
+    print(f"Hotovo. Aktualizovaných: {ok}, preskočených (chyba): {skipped}.")
 
 
 if __name__ == "__main__":
