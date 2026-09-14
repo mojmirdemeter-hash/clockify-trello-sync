@@ -1,0 +1,34 @@
+name: Sync Clockify time to Trello
+
+on:
+  schedule:
+    # Kazdych 30 minut. Ak mate Clockify Free plan a vela kariet/clenov,
+    # zvazte zmenu na '0 * * * *' (raz za hodinu), aby ste sa zmestili
+    # do limitu 30 requestov/hodinu na Free plane.
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}   # umoznuje spustit rucne tlacidlom "Run workflow"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run sync
+        env:
+          CLOCKIFY_API_KEY: ${{ secrets.CLOCKIFY_API_KEY }}
+          CLOCKIFY_WORKSPACE_ID: ${{ vars.CLOCKIFY_WORKSPACE_ID }}
+          CLOCKIFY_PROJECT_ID: ${{ vars.CLOCKIFY_PROJECT_ID }}
+          TRELLO_KEY: ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN: ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_BOARD_ID: ${{ vars.TRELLO_BOARD_ID }}
+          TRELLO_CUSTOM_FIELD_NAME: ${{ vars.TRELLO_CUSTOM_FIELD_NAME }}
+          TRELLO_LIST_NAMES: ${{ vars.TRELLO_LIST_NAMES }}
+        run: python sync_time.py
