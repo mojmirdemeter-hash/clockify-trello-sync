@@ -22,4 +22,3 @@ jobs:
           git config user.email "keepalive-bot@users.noreply.github.com"
           git commit --allow-empty -m "chore: keepalive commit (drzi sync workflow aktivny)"
           git push
-</parameter>
