@@ -12,8 +12,9 @@ Ako to funguje:
    kedy mala. Ak sa aktualny nazov karty odlisuje od poslednej ulozenej
    verzie, prida sa do zoznamu ako dalsi alias - stare aj nove time
    entries (podla starych aj noveho nazvu) sa naďalej pripocitaju.
-4. Sposcita cas zo VSETKYCH aliasov danej karty a zapise sucet (v hodinach)
-   do Trello Custom Field TRELLO_CUSTOM_FIELD_NAME.
+4. Sposcita cas zo VSETKYCH aliasov danej karty a zapise sucet v citatelnom
+   tvare (napr. '3h 15min') do Trello Custom Field TRELLO_CUSTOM_FIELD_NAME
+   (typu Text).
 
 Beziaci na GitHub Actions podla harmonogramu (pozri .github/workflows/sync.yml).
 Nepouziva Clockify Reports API (ta vyzaduje placeny plan) - iba zakladne
@@ -97,8 +98,6 @@ def get_target_list_ids():
 
 
 def get_cards(list_ids):
-    # customFieldItems=true vrati v jednom volani aj hodnoty custom fieldov
-    # na kazdej karte (vratane historie aliasov).
     all_cards = trello_request(
         "GET",
         f"/boards/{TRELLO_BOARD_ID}/cards",
@@ -161,11 +160,22 @@ def collect_seconds_by_description(users):
     return totals
 
 
-def update_custom_field(card_id, field_id, hours):
+def format_duration(seconds):
+    """Formatuje sekundy na citatelny tvar 'Xh Ymin', napr. '3h 15min'."""
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    if h and m:
+        return f"{h}h {m}min"
+    if h:
+        return f"{h}h"
+    return f"{m}min"
+
+
+def update_custom_field(card_id, field_id, seconds):
     trello_request(
         "PUT",
         f"/cards/{card_id}/customField/{field_id}/item",
-        json_body={"value": {"number": str(hours)}},
+        json_body={"value": {"text": format_duration(seconds)}},
     )
 
 
@@ -195,9 +205,9 @@ def main():
             print(f"  (Nový názov zaznamenaný: '{current_name}', history má teraz {len(aliases)} záznam(ov))")
 
         seconds = sum(totals.get(a, 0) for a in aliases)
-        hours = round(seconds / 3600, 2)
-        update_custom_field(card["id"], hours_field_id, hours)
-        print(f"  '{current_name}' -> {hours} h  (aliasy: {aliases})")
+        formatted = format_duration(seconds)
+        update_custom_field(card["id"], hours_field_id, seconds)
+        print(f"  '{current_name}' -> {formatted}  (aliasy: {aliases})")
 
     print("Hotovo.")
 
