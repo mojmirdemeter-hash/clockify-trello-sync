@@ -2,10 +2,10 @@ name: Sync Clockify time to Trello
 
 on:
   schedule:
-    # Kazdych 30 minut. Ak mate Clockify Free plan a vela kariet/clenov,
-    # zvazte zmenu na '0 * * * *' (raz za hodinu), aby ste sa zmestili
-    # do limitu 30 requestov/hodinu na Free plane.
-    - cron: '*/30 * * * *'
+    # Bezi v :07 a :37 kazdej hodiny (nie presne o :00/:30) - GitHub ma
+    # v tychto "okruhlych" casoch najvacsiu zataz a niektore scheduled
+    # behy vtedy zahadzuje. Mimo spicky su spustenia spolahlivejsie.
+    - cron: '7,37 * * * *'
   workflow_dispatch: {}   # umoznuje spustit rucne tlacidlom "Run workflow"
 
 jobs:
