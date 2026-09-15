@@ -6,11 +6,14 @@ Ako to funguje:
 2. Pre kazdeho clena workspace stiahne VSETKY time entries v danom
    Clockify projekte (CLOCKIFY_PROJECT_ID) a sposcita ich podla POPISU
    (description) - presne do tohto pola Clockify Trello extension uklada
-   nazov karty pri trackovani ("Clockify will pick up Trello's card name").
-   Task field sa NEPOUZIVA na parovanie, lebo extension ho pri trackovani
-   priamo z Trello karty nenastavuje spolahlivo.
-3. Pre kazdu kartu najde sucet podla PRESNEJ zhody: nazov karty == popis
-   time entry, a zapise ho (v hodinach) do Trello Custom Field.
+   nazov karty pri trackovani.
+3. Rieseni premenovania karty: kazda karta si v custom field
+   TRELLO_ALIAS_FIELD_NAME (typ Text) drzi ZOZNAM VSETKYCH nazvov, ake
+   kedy mala. Ak sa aktualny nazov karty odlisuje od poslednej ulozenej
+   verzie, prida sa do zoznamu ako dalsi alias - stare aj nove time
+   entries (podla starych aj noveho nazvu) sa naďalej pripocitaju.
+4. Sposcita cas zo VSETKYCH aliasov danej karty a zapise sucet (v hodinach)
+   do Trello Custom Field TRELLO_CUSTOM_FIELD_NAME.
 
 Beziaci na GitHub Actions podla harmonogramu (pozri .github/workflows/sync.yml).
 Nepouziva Clockify Reports API (ta vyzaduje placeny plan) - iba zakladne
@@ -32,7 +35,12 @@ TRELLO_KEY = os.environ["TRELLO_KEY"]
 TRELLO_TOKEN = os.environ["TRELLO_TOKEN"]
 TRELLO_BOARD_ID = os.environ["TRELLO_BOARD_ID"]
 TRELLO_CUSTOM_FIELD_NAME = os.environ.get("TRELLO_CUSTOM_FIELD_NAME", "Natrackovaný čas (h)")
+# Znovu pouzivame pole, ktore uz mas vytvorene ako "Clockify Task ID" -
+# teraz sluzi ako ulozisko historie nazvov karty (aliasov), nie ID tasku.
+TRELLO_ALIAS_FIELD_NAME = os.environ.get("TRELLO_ALIAS_FIELD_NAME", "Clockify Task ID")
 TRELLO_LIST_NAMES = [s.strip() for s in os.environ.get("TRELLO_LIST_NAMES", "").split(",") if s.strip()]
+
+ALIAS_SEPARATOR = "\n---\n"
 
 CLOCKIFY_BASE = "https://api.clockify.me/api/v1"
 TRELLO_BASE = "https://api.trello.com/1"
@@ -64,15 +72,16 @@ def trello_request(method, path, params=None, json_body=None):
     return r.json() if r.text else None
 
 
-def get_custom_field_id():
+def get_custom_field_ids():
     fields = trello_request("GET", f"/boards/{TRELLO_BOARD_ID}/customFields")
-    for f in fields:
-        if f["name"] == TRELLO_CUSTOM_FIELD_NAME:
-            return f["id"]
-    raise RuntimeError(
-        f"Custom field '{TRELLO_CUSTOM_FIELD_NAME}' sa na boarde nenašiel. "
-        f"Skontroluj presný názov (Menu boardu -> Custom Fields)."
-    )
+    by_name = {f["name"]: f["id"] for f in fields}
+    for required in (TRELLO_CUSTOM_FIELD_NAME, TRELLO_ALIAS_FIELD_NAME):
+        if required not in by_name:
+            raise RuntimeError(
+                f"Custom field '{required}' sa na boarde nenašiel. "
+                f"Skontroluj presný názov (Menu boardu -> Custom Fields)."
+            )
+    return by_name[TRELLO_CUSTOM_FIELD_NAME], by_name[TRELLO_ALIAS_FIELD_NAME]
 
 
 def get_target_list_ids():
@@ -88,8 +97,30 @@ def get_target_list_ids():
 
 
 def get_cards(list_ids):
-    all_cards = trello_request("GET", f"/boards/{TRELLO_BOARD_ID}/cards", params={"fields": "name,idList"})
+    # customFieldItems=true vrati v jednom volani aj hodnoty custom fieldov
+    # na kazdej karte (vratane historie aliasov).
+    all_cards = trello_request(
+        "GET",
+        f"/boards/{TRELLO_BOARD_ID}/cards",
+        params={"fields": "name,idList", "customFieldItems": "true"},
+    )
     return [c for c in all_cards if c["idList"] in list_ids]
+
+
+def get_stored_aliases(card, alias_field_id):
+    for item in card.get("customFieldItems", []):
+        if item.get("idCustomField") == alias_field_id:
+            text = (item.get("value") or {}).get("text") or ""
+            return [a for a in text.split(ALIAS_SEPARATOR) if a]
+    return []
+
+
+def store_aliases(card_id, alias_field_id, aliases):
+    trello_request(
+        "PUT",
+        f"/cards/{card_id}/customField/{alias_field_id}/item",
+        json_body={"value": {"text": ALIAS_SEPARATOR.join(aliases)}},
+    )
 
 
 def get_workspace_users():
@@ -109,8 +140,7 @@ def parse_iso8601_duration(s):
 
 def collect_seconds_by_description(users):
     """Stiahne vsetky time entries v danom Clockify projekte (pre vsetkych
-    clenov workspace) a sposcita sekundy podla presneho znenia popisu
-    (description) - to je pole, kam extension uklada nazov Trello karty."""
+    clenov workspace) a sposcita sekundy podla presneho znenia popisu."""
     totals = defaultdict(int)
     for user in users:
         page = 1
@@ -141,7 +171,7 @@ def update_custom_field(card_id, field_id, hours):
 
 def main():
     print("Spúšťam synchronizáciu Clockify -> Trello...")
-    field_id = get_custom_field_id()
+    hours_field_id, alias_field_id = get_custom_field_ids()
     list_ids = get_target_list_ids()
     if not list_ids:
         print("Žiadne cieľové listy sa nenašli, koniec.")
@@ -156,10 +186,18 @@ def main():
     print(f"V Clockify projekte nájdených {len(totals)} unikátnych popisov time entries.")
 
     for card in cards:
-        seconds = totals.get(card["name"].strip(), 0)
+        current_name = card["name"].strip()
+        aliases = get_stored_aliases(card, alias_field_id)
+
+        if current_name not in aliases:
+            aliases.append(current_name)
+            store_aliases(card["id"], alias_field_id, aliases)
+            print(f"  (Nový názov zaznamenaný: '{current_name}', history má teraz {len(aliases)} záznam(ov))")
+
+        seconds = sum(totals.get(a, 0) for a in aliases)
         hours = round(seconds / 3600, 2)
-        update_custom_field(card["id"], field_id, hours)
-        print(f"  '{card['name']}' -> {hours} h")
+        update_custom_field(card["id"], hours_field_id, hours)
+        print(f"  '{current_name}' -> {hours} h  (aliasy: {aliases})")
 
     print("Hotovo.")
 
